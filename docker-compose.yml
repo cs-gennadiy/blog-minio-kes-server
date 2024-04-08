@@ -1,0 +1,91 @@
+version: '3.7'
+
+x-minio-common-env: &common-env
+  MINIO_ROOT_USER: minio
+  MINIO_ROOT_PASSWORD: minio123      
+  MINIO_TEST_S3_ENDPOINT: http://minio:9000
+  MINIO_TEST_S3_BUCKET: test-data-1234
+  MINIO_KMS_KES_KEY_NAME: minio-backend-default-key
+
+services:
+  
+  minio:
+    image: minio/minio:RELEASE.2024-03-26T22-10-45Z
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - ./tests/tls-certs:/tls-certs
+      - ./tests/data:/data
+      - ./tests/secure-kes-client:/secure-kes-client
+    environment:
+      <<: *common-env
+      MINIO_KMS_KES_ENDPOINT:   https://minio-kes:7373
+      MINIO_KMS_KES_CERT_FILE:  /secure-kes-client/client.crt
+      MINIO_KMS_KES_KEY_FILE:   /secure-kes-client/client.key
+      MINIO_KMS_KES_CAPATH:     /tls-certs/kes.crt
+    command: server --console-address ":9001" /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      minio-kes:
+        condition: service_started  
+
+  minio-client:
+    image: minio/mc:RELEASE.2024-03-25T16-41-14Z
+    environment:
+      <<: *common-env
+      MINIO_TEST_S3_ALIAS: minio-test-backend
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set $${MINIO_TEST_S3_ALIAS} $${MINIO_TEST_S3_ENDPOINT} $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb $${MINIO_TEST_S3_ALIAS}/$${MINIO_TEST_S3_BUCKET};
+      /usr/bin/mc encrypt set sse-kms $${MINIO_KMS_KES_KEY_NAME} $${MINIO_TEST_S3_ALIAS}/$${MINIO_TEST_S3_BUCKET};
+      exit 0;
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  minio-kes:
+    image: minio/kes:2024-03-28T12-56-37Z
+    volumes:
+      - ./tests/config:/config
+      - ./tests/tls-certs:/tls-certs
+      - ./tests/tls-keys:/tls-keys
+    ports:
+      - 7373:7373
+    command: server --config /config/config.yaml
+    depends_on:
+      minio-kes-init:
+        condition: service_completed_successfully
+  
+  minio-kes-init:
+    image: minio/kes:2024-03-28T12-56-37Z
+    volumes:
+      - ./tests/config:/config
+      - ./tests/tls-certs:/tls-certs
+      - ./tests/tls-keys:/tls-keys
+      - ./tests/secure-kes-client:/secure-kes-client
+    entrypoint: >
+      /bin/sh -c "
+        ./kes identity new --force --key /tls-keys/kes.key --cert /tls-certs/kes.crt --expiry 8760h --ip '127.0.0.1' --dns minio-kes minio-kes;
+        ./kes identity new --force --key /secure-kes-client/client.key --cert /secure-kes-client/client.crt minioApp;
+        cp /config/template.yaml /config/config.yaml;
+        echo '      - '$(./kes identity of /secure-kes-client/client.crt | tail -n 1) >> /config/config.yaml;
+        exit 0;
+      "
+
+  boto3-client:
+    image: demisto/boto3py3:1.0.0.91616
+    environment:
+      <<: *common-env
+    volumes:
+      - ./src:/src
+    command: python /src/upload_to_sse_kms_bucket.py
+    depends_on:
+      minio-client:
+        condition: service_completed_successfully
